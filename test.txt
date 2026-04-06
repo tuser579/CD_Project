@@ -1,0 +1,6 @@
+#include<stdio.h>
+
+int mainFn() [
+    dec _test1a = 5..
+    return 0..
+]
