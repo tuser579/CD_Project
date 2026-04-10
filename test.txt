@@ -1,6 +1,8 @@
 #include<stdio.h>
 
 int mainFn() [
-    dec _test1a = 5..
+    dec _input3k = 10..  
+    dec _result4m = 2..
+    printfFn( _rt4c)..
     return 0..
 ]

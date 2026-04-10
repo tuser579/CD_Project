@@ -1,429 +1,433 @@
 #include <stdio.h>
 #include <string.h>
-#include <ctype.h>
-#include <stdlib.h>
+#include "input_system.h"
 
-// ============= TOKEN DEFINITIONS =============
+/* ════════════════════════════════════════════════════════════
+   TOKEN TYPES
+   ════════════════════════════════════════════════════════════ */
 typedef enum {
-    TOKEN_INCLUDE, TOKEN_COMMENT, TOKEN_DEC, TOKEN_INT, TOKEN_IDENTIFIER,
-    TOKEN_FUNCTION, TOKEN_LOOP_LABEL, TOKEN_WHILE, TOKEN_RETURN, TOKEN_BREAK,
-    TOKEN_PRINTF, TOKEN_NUMBER, TOKEN_OPERATOR, TOKEN_DOTDOT, TOKEN_LBRACKET,
-    TOKEN_RBRACKET, TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_COLON, TOKEN_COMMA,
-    TOKEN_EOF, TOKEN_ERROR
+    TOK_HEADER     =  0,
+    TOK_COMMENT    =  1,
+    TOK_TYPE_INT   =  2,
+    TOK_TYPE_DEC   =  3,
+    TOK_VAR_NAME   =  4,
+    TOK_FUNC_NAME  =  5,
+    TOK_LOOP_LABEL =  6,
+    TOK_STMT_END   =  7,
+    TOK_NUMBER     =  8,
+    TOK_SYMBOL     =  9,
+    TOK_UNKNOWN    = 10
 } TokenType;
 
-typedef struct {
-    TokenType type;
-    char lexeme[100];
-    int line;
-    int column;
-} Token;
-
-// ============= DFA STATES =============
-#define MAX_STATES 100
-#define MAX_INPUTS 128
-
-// DFA State definitions
-enum {
-    STATE_START = 0,
-    STATE_INCLUDE, STATE_INCLUDE_DONE,
-    STATE_COMMENT_SLASH, STATE_COMMENT, STATE_COMMENT_DONE,
-    STATE_NUMBER,
-    STATE_IDENTIFIER,
-    STATE_VARIABLE_UNDER, STATE_VARIABLE_LETTERS, STATE_VARIABLE_DIGIT, STATE_VARIABLE_FINAL,
-    STATE_FUNCTION, STATE_FUNCTION_F, STATE_FUNCTION_FN,
-    STATE_KEYWORD_D, STATE_KEYWORD_DE, STATE_KEYWORD_DEC,
-    STATE_KEYWORD_I, STATE_KEYWORD_IN, STATE_KEYWORD_INT,
-    STATE_KEYWORD_W, STATE_KEYWORD_WH, STATE_KEYWORD_WHI, STATE_KEYWORD_WHIL, STATE_KEYWORD_WHILE,
-    STATE_KEYWORD_R, STATE_KEYWORD_RE, STATE_KEYWORD_RET, STATE_KEYWORD_RETU, STATE_KEYWORD_RETUR, STATE_KEYWORD_RETURN,
-    STATE_KEYWORD_B, STATE_KEYWORD_BR, STATE_KEYWORD_BRE, STATE_KEYWORD_BREA, STATE_KEYWORD_BREAK,
-    STATE_KEYWORD_P, STATE_KEYWORD_PR, STATE_KEYWORD_PRI, STATE_KEYWORD_PRIN, STATE_KEYWORD_PRINT, STATE_KEYWORD_PRINTF,
-    STATE_LOOP_L, STATE_LOOP_LO, STATE_LOOP_LOO, STATE_LOOP_LOOP, STATE_LOOP_UNDER,
-    STATE_LOOP_LETTERS, STATE_LOOP_DIGIT1, STATE_LOOP_DIGIT2, STATE_LOOP_COLON,
-    STATE_OPERATOR_EQ, STATE_OPERATOR_PLUS, STATE_OPERATOR_MINUS, STATE_OPERATOR_LT, STATE_OPERATOR_LE,
-    STATE_DOT, STATE_DOTDOT,
-    STATE_LBRACKET, STATE_RBRACKET, STATE_LPAREN, STATE_RPAREN, STATE_COLON, STATE_COMMA,
-    STATE_DEAD = 99
+/* parallel to the enum — index IS the token type */
+static const char *token_label[] = {
+    "HEADER",
+    "COMMENT",
+    "TYPE:int",
+    "TYPE:dec",
+    "VAR_NAME",
+    "FUNC_NAME",
+    "LOOP_LABEL",
+    "STMT_END",
+    "NUMBER",
+    "SYMBOL",
+    "UNKNOWN"
 };
 
-// DFA Transition Table
-int dfa[MAX_STATES][MAX_INPUTS];
+/* ════════════════════════════════════════════════════════════
+   MASTER DFA STATE ENUMERATION
+   ════════════════════════════════════════════════════════════
 
-// Accepting state info
-int accepting[MAX_STATES];
-TokenType accept_type[MAX_STATES];
-int need_validation[MAX_STATES];
+   Every token class gets its own sub-path through the DFA.
+   State names encode what has been consumed so far.
 
-// Global lexer state
-char *source;
-int pos = 0;
-int line = 1;
-int col = 1;
+   HEADER path : H_*
+     #include<stdio.h>  — matched character-by-character as
+     a straight chain; only one possible lexeme so we treat
+     each character position as a state.
 
-// ============= VALIDATION FUNCTIONS =============
-int validate_variable(char *str) {
-    int len = strlen(str);
-    if (len < 4 || str[0] != '_') return 0;
-    int i = 1;
-    while (i < len && isalpha(str[i])) i++;
-    if (i == 1 || i >= len-1) return 0;
-    if (!isdigit(str[i])) return 0;
-    i++;
-    if (i >= len || !isalpha(str[i])) return 0;
-    i++;
-    return (i == len);
+   COMMENT path : CM_*
+     //  followed by zero-or-more (alpha | space)
+
+   NUMBER path : NM_*
+     one or more digits
+
+   SYMBOL path : SY_*
+     single character  ( ) [ ] < >
+
+   STMT_END path : SE_*
+     ..   (two dots)
+
+   VAR_NAME path : VA_*
+     _  [alpha]+  [digit]  [alpha]
+
+   FUNC_NAME path : FN_*
+     [alpha]+  ending in 'F' 'n'
+     (shares alpha states with keyword / type paths)
+
+   TYPE / KEYWORD path : KW_*
+     "int"  →  TOK_TYPE_INT
+     "dec"  →  TOK_TYPE_DEC
+
+   LOOP_LABEL path : LL_*
+     loop_  [alpha]+  [digit][digit]  :
+
+   DEAD : absorbing error state
+   ════════════════════════════════════════════════════════════ */
+typedef enum {
+
+    /* ── start ─────────────────────────────────── */
+    S_START = 0,
+
+    /* ── HEADER:  #include<stdio.h> ────────────── */
+    H_HASH,          /*  #                  */
+    H_I,             /*  #i                 */
+    H_N,             /*  #in                */
+    H_C,             /*  #inc               */
+    H_L,             /*  #incl              */
+    H_U,             /*  #inclu             */
+    H_D,             /*  #includ            */
+    H_E1,            /*  #include           */
+    H_LT,            /*  #include<          */
+    H_S,             /*  #include<s         */
+    H_T,             /*  #include<st        */
+    H_DI,            /*  #include<sti       */
+    H_O,             /*  #include<stdi      */
+    H_DOT,           /*  #include<stdio     */
+    H_H,             /*  #include<stdio.    */
+    H_GT,            /*  #include<stdio.h   */
+    H_DONE,          /*  #include<stdio.h>  ← ACCEPT */
+
+    /* ── COMMENT:  // alpha* ────────────────────── */
+    CM_SLASH1,       /*  /                  */
+    CM_SLASH2,       /*  //                 ← ACCEPT (empty) */
+    CM_BODY,         /*  // chars           ← ACCEPT */
+
+    /* ── STMT_END:  .. ──────────────────────────── */
+    SE_DOT1,         /*  .                  */
+    SE_DOT2,         /*  ..                 ← ACCEPT */
+
+    /* ── NUMBER:  [0-9]+ ────────────────────────── */
+    NM_DIGIT,        /*  one or more digits ← ACCEPT */
+
+    /* ── SYMBOL:  single ( ) [ ] < > ───────────── */
+    SY_ONE,          /*  one symbol char    ← ACCEPT */
+
+    /* ── KEYWORD / TYPE shared prefix ──────────── */
+    /*   "int"   */
+    KW_I,            /*  i                  */
+    KW_IN,           /*  in                 */
+    KW_INT,          /*  int                ← ACCEPT TYPE_INT */
+    /*   "dec"   */
+    KW_D,            /*  d                  */
+    KW_DE,           /*  de                 */
+    KW_DEC,          /*  dec                ← ACCEPT TYPE_DEC */
+
+    /* ── FUNC_NAME:  [alpha]+ ending Fn ─────────── */
+    /*   any alpha word that doesn't match a keyword
+         lives in these states until it ends in Fn    */
+    FN_ALPHA,        /*  one+ alpha (generic)          */
+    FN_F,            /*  last char seen was 'F'         */
+    FN_DONE,         /*  last two chars were 'Fn' ← ACCEPT */
+
+    /* ── VAR_NAME:  _ [alpha]+ [digit] [alpha] ─── */
+    VA_UNDER,        /*  _                  */
+    VA_ALPHA,        /*  _ alpha+           */
+    VA_DIGIT,        /*  _ alpha+ digit     */
+    VA_DONE,         /*  _ alpha+ digit alpha ← ACCEPT */
+
+    /* ── LOOP_LABEL:  loop_ [alpha]+ [d][d] : ─── */
+    LL_L,            /*  l                  */
+    LL_LO,           /*  lo                 */
+    LL_LOO,          /*  loo                */
+    LL_LOOP,         /*  loop               */
+    LL_LOOP_,        /*  loop_              */
+    LL_BODY,         /*  loop_ alpha+       */
+    LL_D1,           /*  loop_ alpha+ digit */
+    LL_D2,           /*  loop_ alpha+ digit digit */
+    LL_DONE,         /*  loop_ alpha+ digit digit : ← ACCEPT */
+
+    /* ── dead / error ───────────────────────────── */
+    S_DEAD,
+
+    NUM_STATES       /* must be last */
+} State;
+
+/* ════════════════════════════════════════════════════════════
+   ACCEPTING STATE TABLE
+   Index = State enum value.
+   Value = TokenType if accepting, -1 if not.
+   No if-else needed: result = accept_token[final_state]
+   and if result >= 0 it IS the token type.
+   ════════════════════════════════════════════════════════════ */
+static const int accept_token[] = {
+    /* S_START    */ -1,
+    /* H_HASH     */ -1,
+    /* H_I        */ -1,
+    /* H_N        */ -1,
+    /* H_C        */ -1,
+    /* H_L        */ -1,
+    /* H_U        */ -1,
+    /* H_D        */ -1,
+    /* H_E1       */ -1,
+    /* H_LT       */ -1,
+    /* H_S        */ -1,
+    /* H_T        */ -1,
+    /* H_DI       */ -1,
+    /* H_O        */ -1,
+    /* H_DOT      */ -1,
+    /* H_H        */ -1,
+    /* H_GT       */ -1,
+    /* H_DONE     */ TOK_HEADER,
+    /* CM_SLASH1  */ -1,
+    /* CM_SLASH2  */ TOK_COMMENT,
+    /* CM_BODY    */ TOK_COMMENT,
+    /* SE_DOT1    */ -1,
+    /* SE_DOT2    */ TOK_STMT_END,
+    /* NM_DIGIT   */ TOK_NUMBER,
+    /* SY_ONE     */ TOK_SYMBOL,
+    /* KW_I       */ -1,
+    /* KW_IN      */ -1,
+    /* KW_INT     */ TOK_TYPE_INT,
+    /* KW_D       */ -1,
+    /* KW_DE      */ -1,
+    /* KW_DEC     */ TOK_TYPE_DEC,
+    /* FN_ALPHA   */ -1,
+    /* FN_F       */ -1,
+    /* FN_DONE    */ TOK_FUNC_NAME,
+    /* VA_UNDER   */ -1,
+    /* VA_ALPHA   */ -1,
+    /* VA_DIGIT   */ -1,
+    /* VA_DONE    */ TOK_VAR_NAME,
+    /* LL_L       */ -1,
+    /* LL_LO      */ -1,
+    /* LL_LOO     */ -1,
+    /* LL_LOOP    */ -1,
+    /* LL_LOOP_   */ -1,
+    /* LL_BODY    */ -1,
+    /* LL_D1      */ -1,
+    /* LL_D2      */ -1,
+    /* LL_DONE    */ TOK_LOOP_LABEL,
+    /* S_DEAD     */ -1
+};
+
+/* ════════════════════════════════════════════════════════════
+   MASTER TRANSITION TABLE
+   next_state[current_state][input_id]
+
+   Rows  = State enum  (NUM_STATES rows)
+   Cols  = InputID enum (NUM_INPUTS = 14 cols)
+
+   Column order (must match InputID enum in input_system.h):
+     0  IN_HASH
+     1  IN_SLASH
+     2  IN_DOT
+     3  IN_UNDER
+     4  IN_UPPER_F
+     5  IN_LOWER_N
+     6  IN_LOWER_L
+     7  IN_LOWER_O
+     8  IN_LOWER_P
+     9  IN_COLON
+    10  IN_ALPHA
+    11  IN_DIGIT
+    12  IN_SYMBOL
+    13  IN_OTHER
+   ════════════════════════════════════════════════════════════ */
+
+/* shorthand to keep the table readable */
+#define DD S_DEAD
+#define __ S_DEAD   /* unused / forbidden transition */
+
+static const State next_state[NUM_STATES][NUM_INPUTS] = {
+/*               #       /       .       _       F       n       l       o       p       :      alpha  digit  sym   other */
+/* S_START  */{ H_HASH, CM_SLASH1,SE_DOT1,VA_UNDER,FN_F,  KW_IN+1,LL_L,  FN_ALPHA,FN_ALPHA,DD, FN_ALPHA,NM_DIGIT,SY_ONE,DD },
+
+/* H_HASH   */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_I,    DD,     DD,   DD },
+/* H_I      */{ DD,     DD,      DD,     DD,     DD,     H_N,    DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+/* H_N      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_C,    DD,     DD,   DD },
+/* H_C      */{ DD,     DD,      DD,     DD,     DD,     DD,     H_L,    DD,     DD,     DD,     DD,     DD,     DD,   DD },
+/* H_L      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_U,    DD,     DD,   DD },
+/* H_U      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_D,    DD,     DD,   DD },
+/* H_D      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_E1,   DD,     DD,   DD },
+/* H_E1     */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_LT, DD },
+/* H_LT     */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_S,    DD,     DD,   DD },
+/* H_S      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_T,    DD,     DD,   DD },
+/* H_T      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_DI,   DD,     DD,   DD },
+/* H_DI     */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     H_O,    DD,     DD,     DD,     DD,     DD,   DD },
+/* H_O      */{ DD,     DD,      H_DOT,  DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+/* H_DOT    */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_H,    DD,     DD,   DD },
+/* H_H      */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     H_GT, DD },
+/* H_GT     */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   H_DONE },
+/* H_DONE   */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+
+/* CM_SLASH1*/{ DD,     CM_SLASH2,DD,    DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+/* CM_SLASH2*/{ DD,     DD,      DD,     DD,     CM_BODY,CM_BODY,CM_BODY,CM_BODY,CM_BODY,DD,    CM_BODY, DD,    DD,   CM_BODY},
+/* CM_BODY  */{ DD,     DD,      DD,     DD,     CM_BODY,CM_BODY,CM_BODY,CM_BODY,CM_BODY,DD,    CM_BODY, DD,    DD,   CM_BODY},
+
+/* SE_DOT1  */{ DD,     DD,      SE_DOT2,DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+/* SE_DOT2  */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+
+/* NM_DIGIT */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     NM_DIGIT,DD,  DD },
+
+/* SY_ONE   */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+
+/* KW_I     */{ DD,     DD,      DD,     DD,     FN_F,   KW_IN,  FN_ALPHA,FN_ALPHA,FN_ALPHA,DD, FN_ALPHA,DD,    DD,   DD },
+/* KW_IN    */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,KW_INT, DD,     DD,   DD },
+/* KW_INT   */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,    DD,   DD },
+
+/* KW_D     */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,    DD,   DD },
+/* KW_DE    */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,KW_DEC, DD,     DD,   DD },
+/* KW_DEC   */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,    DD,   DD },
+
+/* FN_ALPHA */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,    DD,   DD },
+/* FN_F     */{ DD,     DD,      DD,     DD,     FN_F,   FN_DONE, FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,    DD,   DD },
+/* FN_DONE  */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,    DD,   DD },
+
+/* VA_UNDER */{ DD,     DD,      DD,     DD,     VA_ALPHA,VA_ALPHA,VA_ALPHA,VA_ALPHA,VA_ALPHA,DD,VA_ALPHA,DD,    DD,   DD },
+/* VA_ALPHA */{ DD,     DD,      DD,     DD,     VA_ALPHA,VA_ALPHA,VA_ALPHA,VA_ALPHA,VA_ALPHA,DD,VA_ALPHA,VA_DIGIT,DD, DD },
+/* VA_DIGIT */{ DD,     DD,      DD,     DD,     VA_DONE, VA_DONE, VA_DONE, VA_DONE, VA_DONE,DD, VA_DONE, DD,   DD,   DD },
+/* VA_DONE  */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+
+/* LL_L     */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,LL_LO,  FN_ALPHA,DD, FN_ALPHA,DD,   DD,   DD },
+/* LL_LO    */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,LL_LOO, FN_ALPHA,DD, FN_ALPHA,DD,   DD,   DD },
+/* LL_LOO   */{ DD,     DD,      DD,     DD,     FN_F,   FN_ALPHA,FN_ALPHA,FN_ALPHA,LL_LOOP,DD, FN_ALPHA,DD,   DD,   DD },
+/* LL_LOOP  */{ DD,     DD,      DD,     LL_LOOP_,FN_F,  FN_ALPHA,FN_ALPHA,FN_ALPHA,FN_ALPHA,DD,FN_ALPHA,DD,   DD,   DD },
+/* LL_LOOP_ */{ DD,     DD,      DD,     DD,     LL_BODY,LL_BODY, LL_BODY, LL_BODY, LL_BODY,DD, LL_BODY, DD,   DD,   DD },
+/* LL_BODY  */{ DD,     DD,      DD,     DD,     LL_BODY,LL_BODY, LL_BODY, LL_BODY, LL_BODY,DD, LL_BODY, LL_D1,DD,  DD },
+/* LL_D1    */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     LL_D2,  DD,   DD },
+/* LL_D2    */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     LL_DONE,DD,     DD,     DD,   DD },
+/* LL_DONE  */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD },
+
+/* S_DEAD   */{ DD,     DD,      DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,     DD,   DD }
+};
+
+#undef DD
+#undef __
+
+/* ════════════════════════════════════════════════════════════
+   run_dfa  — identical to the lab's main loop
+   Feeds one lexeme through the master DFA.
+   Returns the TokenType or TOK_UNKNOWN.
+   Zero if-else, zero strcmp.
+   ════════════════════════════════════════════════════════════ */
+static TokenType run_dfa(const char *lexeme) {
+    State state = S_START;
+
+    for (int i = 0; lexeme[i] != '\0'; i++) {
+        InputID inp = get_input(lexeme[i]);
+        state = next_state[state][inp];
+
+        /* S_DEAD is absorbing — stop early */
+        static const int is_dead[NUM_STATES] = {
+            [S_DEAD] = 1
+        };
+        if (is_dead[state]) break;
+    }
+
+    /* accept_token[] maps state → TokenType (-1 = unknown) */
+    int tok = accept_token[state];
+    /* branchless clamp: if tok < 0 return UNKNOWN, else tok */
+    return (TokenType)( (tok & ~(tok >> 31)) |
+                        (TOK_UNKNOWN & (tok >> 31)) );
 }
 
-int validate_loop_label(char *str) {
-    int len = strlen(str);
-    if (len < 8 || strncmp(str, "loop_", 5) != 0) return 0;
-    int i = 5;
-    while (i < len && isalpha(str[i])) i++;
-    if (i == 5) return 0;
-    if (i+1 >= len || !isdigit(str[i]) || !isdigit(str[i+1])) return 0;
-    i += 2;
-    return (i == len-1 && str[len-1] == ':');
+/* ════════════════════════════════════════════════════════════
+   TOKENISER
+   Scans source line-by-line, extracts raw lexemes,
+   then calls run_dfa() — the only classification step.
+   ════════════════════════════════════════════════════════════ */
+
+/* Special 2-char and 1-char splitters that need early detection
+   before the general word collector runs.                    */
+static void emit(const char *lex, int line_no) {
+    TokenType tok = run_dfa(lex);
+    printf("  %-24s  %-14s  line %d\n",
+           lex, token_labels[tok], line_no);
 }
 
-// ============= DFA INITIALIZATION =============
-void init_dfa() {
-    // Initialize all to DEAD state
-    for (int i = 0; i < MAX_STATES; i++)
-        for (int j = 0; j < MAX_INPUTS; j++)
-            dfa[i][j] = STATE_DEAD;
-    
-    // Clear accepting states
-    for (int i = 0; i < MAX_STATES; i++) {
-        accepting[i] = 0;
-        need_validation[i] = 0;
+void tokenize(const char *source) {
+    char line[512], buf[256];
+    int  line_no = 0;
+    const char *p = source;
+
+    printf("\n┌─────────────────────────────────────────────────┐\n");
+    printf("│            LEXICAL ANALYSIS OUTPUT             │\n");
+    printf("├──────────────────────────┬──────────────┬──────┤\n");
+    printf("│ LEXEME                   │ TOKEN        │ LINE │\n");
+    printf("├──────────────────────────┼──────────────┼──────┤\n");
+
+    while (*p) {
+        /* collect one line */
+        int li = 0;
+        while (*p && *p != '\n') line[li++] = *p++;
+        if (*p == '\n') p++;
+        line[li] = '\0';
+        line_no++;
+
+        int i = 0;
+        while (line[i]) {
+            unsigned char ch = (unsigned char)line[i];
+
+            /* ── whitespace ── */
+            if (ch == ' ' || ch == '\t') { i++; continue; }
+
+            /* ── comment: // consumes rest of line ── */
+            if (ch == '/' && line[i+1] == '/') {
+                int bi = 0;
+                while (line[i]) buf[bi++] = line[i++];
+                buf[bi] = '\0';
+                emit(buf, line_no);
+                break;
+            }
+
+            /* ── ".." two-char token ── */
+            if (ch == '.' && line[i+1] == '.') {
+                buf[0]='.'; buf[1]='.'; buf[2]='\0';
+                emit(buf, line_no);
+                i += 2; continue;
+            }
+
+            /* ── single-char symbol ── */
+            if (get_input(ch) == IN_SYMBOL) {
+                buf[0] = ch; buf[1] = '\0';
+                emit(buf, line_no);
+                i++; continue;
+            }
+
+            /* ── general lexeme: collect until delimiter ── */
+            {
+                int bi = 0;
+                while (line[i]
+                    && line[i] != ' ' && line[i] != '\t'
+                    && get_input((unsigned char)line[i]) != IN_SYMBOL
+                    && !(line[i]=='.' && line[i+1]=='.'))
+                {
+                    buf[bi++] = line[i++];
+                }
+                buf[bi] = '\0';
+                if (bi > 0) emit(buf, line_no);
+            }
+        }
     }
-    
-    // Setup DFA for #include<stdio.h>
-    dfa[STATE_START]['#'] = STATE_INCLUDE;
-    for (char c = 'a'; c <= 'z'; c++) {
-        if (c == 'i') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'n') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'c') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'l') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'u') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'd') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'e') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 'h') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 's') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else if (c == 't') dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-        else dfa[STATE_INCLUDE][c] = STATE_INCLUDE;
-    }
-    dfa[STATE_INCLUDE]['<'] = STATE_INCLUDE;
-    dfa[STATE_INCLUDE]['>'] = STATE_INCLUDE_DONE;
-    dfa[STATE_INCLUDE]['.'] = STATE_INCLUDE;
-    accepting[STATE_INCLUDE_DONE] = 1;
-    accept_type[STATE_INCLUDE_DONE] = TOKEN_INCLUDE;
-    
-    // Setup DFA for comments
-    dfa[STATE_START]['/'] = STATE_COMMENT_SLASH;
-    dfa[STATE_COMMENT_SLASH]['/'] = STATE_COMMENT;
-    for (int c = 'a'; c <= 'z'; c++) dfa[STATE_COMMENT][c] = STATE_COMMENT;
-    dfa[STATE_COMMENT][' '] = STATE_COMMENT;
-    accepting[STATE_COMMENT] = 1;
-    accept_type[STATE_COMMENT] = TOKEN_COMMENT;
-    
-    // Setup DFA for numbers
-    for (int d = '0'; d <= '9'; d++) {
-        dfa[STATE_START][d] = STATE_NUMBER;
-        dfa[STATE_NUMBER][d] = STATE_NUMBER;
-    }
-    accepting[STATE_NUMBER] = 1;
-    accept_type[STATE_NUMBER] = TOKEN_NUMBER;
-    
-    // Setup DFA for underscore (variables start)
-    dfa[STATE_START]['_'] = STATE_VARIABLE_UNDER;
-    for (int c = 'a'; c <= 'z'; c++) {
-        dfa[STATE_VARIABLE_UNDER][c] = STATE_VARIABLE_LETTERS;
-        dfa[STATE_VARIABLE_LETTERS][c] = STATE_VARIABLE_LETTERS;
-        dfa[STATE_VARIABLE_LETTERS][c] = STATE_VARIABLE_LETTERS;
-    }
-    for (int d = '0'; d <= '9'; d++) {
-        dfa[STATE_VARIABLE_LETTERS][d] = STATE_VARIABLE_DIGIT;
-    }
-    for (int c = 'a'; c <= 'z'; c++) {
-        dfa[STATE_VARIABLE_DIGIT][c] = STATE_VARIABLE_FINAL;
-    }
-    accepting[STATE_VARIABLE_FINAL] = 1;
-    accept_type[STATE_VARIABLE_FINAL] = TOKEN_IDENTIFIER;
-    need_validation[STATE_VARIABLE_FINAL] = 1;
-    
-    // Setup DFA for letters (keywords, functions, identifiers)
-    for (int c = 'a'; c <= 'z'; c++) {
-        dfa[STATE_START][c] = STATE_IDENTIFIER;
-        dfa[STATE_IDENTIFIER][c] = STATE_IDENTIFIER;
-        dfa[STATE_IDENTIFIER][c] = STATE_IDENTIFIER;
-        dfa[STATE_IDENTIFIER][c] = STATE_IDENTIFIER;
-    }
-    
-    // Keyword: dec
-    dfa[STATE_START]['d'] = STATE_KEYWORD_D;
-    dfa[STATE_KEYWORD_D]['e'] = STATE_KEYWORD_DE;
-    dfa[STATE_KEYWORD_DE]['c'] = STATE_KEYWORD_DEC;
-    accepting[STATE_KEYWORD_DEC] = 1;
-    accept_type[STATE_KEYWORD_DEC] = TOKEN_DEC;
-    
-    // Keyword: int
-    dfa[STATE_START]['i'] = STATE_KEYWORD_I;
-    dfa[STATE_KEYWORD_I]['n'] = STATE_KEYWORD_IN;
-    dfa[STATE_KEYWORD_IN]['t'] = STATE_KEYWORD_INT;
-    accepting[STATE_KEYWORD_INT] = 1;
-    accept_type[STATE_KEYWORD_INT] = TOKEN_INT;
-    
-    // Keyword: while
-    dfa[STATE_START]['w'] = STATE_KEYWORD_W;
-    dfa[STATE_KEYWORD_W]['h'] = STATE_KEYWORD_WH;
-    dfa[STATE_KEYWORD_WH]['i'] = STATE_KEYWORD_WHI;
-    dfa[STATE_KEYWORD_WHI]['l'] = STATE_KEYWORD_WHIL;
-    dfa[STATE_KEYWORD_WHIL]['e'] = STATE_KEYWORD_WHILE;
-    accepting[STATE_KEYWORD_WHILE] = 1;
-    accept_type[STATE_KEYWORD_WHILE] = TOKEN_WHILE;
-    
-    // Keyword: return
-    dfa[STATE_START]['r'] = STATE_KEYWORD_R;
-    dfa[STATE_KEYWORD_R]['e'] = STATE_KEYWORD_RE;
-    dfa[STATE_KEYWORD_RE]['t'] = STATE_KEYWORD_RET;
-    dfa[STATE_KEYWORD_RET]['u'] = STATE_KEYWORD_RETU;
-    dfa[STATE_KEYWORD_RETU]['r'] = STATE_KEYWORD_RETUR;
-    dfa[STATE_KEYWORD_RETUR]['n'] = STATE_KEYWORD_RETURN;
-    accepting[STATE_KEYWORD_RETURN] = 1;
-    accept_type[STATE_KEYWORD_RETURN] = TOKEN_RETURN;
-    
-    // Keyword: break
-    dfa[STATE_START]['b'] = STATE_KEYWORD_B;
-    dfa[STATE_KEYWORD_B]['r'] = STATE_KEYWORD_BR;
-    dfa[STATE_KEYWORD_BR]['e'] = STATE_KEYWORD_BRE;
-    dfa[STATE_KEYWORD_BRE]['a'] = STATE_KEYWORD_BREA;
-    dfa[STATE_KEYWORD_BREA]['k'] = STATE_KEYWORD_BREAK;
-    accepting[STATE_KEYWORD_BREAK] = 1;
-    accept_type[STATE_KEYWORD_BREAK] = TOKEN_BREAK;
-    
-    // Function detection (ends with Fn)
-    for (int c = 'a'; c <= 'z'; c++) {
-        dfa[STATE_IDENTIFIER][c] = STATE_FUNCTION;
-        dfa[STATE_FUNCTION][c] = STATE_FUNCTION;
-        dfa[STATE_FUNCTION]['F'] = STATE_FUNCTION_F;
-        dfa[STATE_FUNCTION_F]['n'] = STATE_FUNCTION_FN;
-    }
-    accepting[STATE_FUNCTION_FN] = 1;
-    accept_type[STATE_FUNCTION_FN] = TOKEN_FUNCTION;
-    
-    // Loop label detection
-    dfa[STATE_START]['l'] = STATE_LOOP_L;
-    dfa[STATE_LOOP_L]['o'] = STATE_LOOP_LO;
-    dfa[STATE_LOOP_LO]['o'] = STATE_LOOP_LOO;
-    dfa[STATE_LOOP_LOO]['p'] = STATE_LOOP_LOOP;
-    dfa[STATE_LOOP_LOOP]['_'] = STATE_LOOP_UNDER;
-    for (int c = 'a'; c <= 'z'; c++) {
-        dfa[STATE_LOOP_UNDER][c] = STATE_LOOP_LETTERS;
-        dfa[STATE_LOOP_LETTERS][c] = STATE_LOOP_LETTERS;
-    }
-    for (int d = '0'; d <= '9'; d++) {
-        dfa[STATE_LOOP_LETTERS][d] = STATE_LOOP_DIGIT1;
-        dfa[STATE_LOOP_DIGIT1][d] = STATE_LOOP_DIGIT2;
-    }
-    dfa[STATE_LOOP_DIGIT2][':'] = STATE_LOOP_COLON;
-    accepting[STATE_LOOP_COLON] = 1;
-    accept_type[STATE_LOOP_COLON] = TOKEN_LOOP_LABEL;
-    need_validation[STATE_LOOP_COLON] = 1;
-    
-    // Operators
-    dfa[STATE_START]['='] = STATE_OPERATOR_EQ;
-    dfa[STATE_START]['+'] = STATE_OPERATOR_PLUS;
-    dfa[STATE_START]['-'] = STATE_OPERATOR_MINUS;
-    dfa[STATE_START]['<'] = STATE_OPERATOR_LT;
-    dfa[STATE_OPERATOR_LT]['='] = STATE_OPERATOR_LE;
-    accepting[STATE_OPERATOR_EQ] = accepting[STATE_OPERATOR_PLUS] = 
-    accepting[STATE_OPERATOR_MINUS] = accepting[STATE_OPERATOR_LT] = 
-    accepting[STATE_OPERATOR_LE] = 1;
-    accept_type[STATE_OPERATOR_EQ] = accept_type[STATE_OPERATOR_PLUS] = 
-    accept_type[STATE_OPERATOR_MINUS] = accept_type[STATE_OPERATOR_LT] = 
-    accept_type[STATE_OPERATOR_LE] = TOKEN_OPERATOR;
-    
-    // Dot and dotdot
-    dfa[STATE_START]['.'] = STATE_DOT;
-    dfa[STATE_DOT]['.'] = STATE_DOTDOT;
-    accepting[STATE_DOTDOT] = 1;
-    accept_type[STATE_DOTDOT] = TOKEN_DOTDOT;
-    
-    // Single character tokens
-    dfa[STATE_START]['['] = STATE_LBRACKET;
-    dfa[STATE_START][']'] = STATE_RBRACKET;
-    dfa[STATE_START]['('] = STATE_LPAREN;
-    dfa[STATE_START][')'] = STATE_RPAREN;
-    dfa[STATE_START][':'] = STATE_COLON;
-    dfa[STATE_START][','] = STATE_COMMA;
-    
-    accepting[STATE_LBRACKET] = 1; accept_type[STATE_LBRACKET] = TOKEN_LBRACKET;
-    accepting[STATE_RBRACKET] = 1; accept_type[STATE_RBRACKET] = TOKEN_RBRACKET;
-    accepting[STATE_LPAREN] = 1; accept_type[STATE_LPAREN] = TOKEN_LPAREN;
-    accepting[STATE_RPAREN] = 1; accept_type[STATE_RPAREN] = TOKEN_RPAREN;
-    accepting[STATE_COLON] = 1; accept_type[STATE_COLON] = TOKEN_COLON;
-    accepting[STATE_COMMA] = 1; accept_type[STATE_COMMA] = TOKEN_COMMA;
+    printf("└──────────────────────────┴──────────────┴──────┘\n");
 }
 
-// ============= TOKEN GETTER USING DFA =============
-void skip_whitespace() {
-    while (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n') {
-        if (source[pos] == '\n') {
-            line++;
-            col = 1;
-        } else {
-            col++;
-        }
-        pos++;
-    }
-}
+/* ════════════════════════════════════════════════════════════
+   MAIN  — reads filename from argv[1], falls back to test.txt
+   ════════════════════════════════════════════════════════════ */
+int main(int argc, char *argv[]) {
 
-Token get_next_token() {
-    Token token;
-    token.type = TOKEN_ERROR;
-    token.lexeme[0] = '\0';
-    token.line = line;
-    token.column = col;
-    
-    skip_whitespace();
-    
-    if (source[pos] == '\0') {
-        token.type = TOKEN_EOF;
-        strcpy(token.lexeme, "EOF");
-        return token;
-    }
-    
-    // Special case for #include (not handled by DFA properly)
-    if (strncmp(&source[pos], "#include<stdio.h>", 17) == 0) {
-        token.type = TOKEN_INCLUDE;
-        strncpy(token.lexeme, &source[pos], 17);
-        token.lexeme[17] = '\0';
-        pos += 17;
-        col += 17;
-        return token;
-    }
-    
-    int state = STATE_START;
-    int start_pos = pos;
-    int start_line = line;
-    int start_col = col;
-    int last_accept = -1;
-    int last_accept_pos = -1;
-    
-    while (1) {
-        char c = source[pos];
-        if (c == '\0' || c == ' ' || c == '\t' || c == '\n') break;
-        
-        int next = dfa[state][(unsigned char)c];
-        if (next == STATE_DEAD) break;
-        
-        state = next;
-        pos++;
-        col++;
-        
-        if (accepting[state]) {
-            last_accept = state;
-            last_accept_pos = pos;
-        }
-    }
-    
-    if (last_accept != -1) {
-        int len = last_accept_pos - start_pos;
-        strncpy(token.lexeme, &source[start_pos], len);
-        token.lexeme[len] = '\0';
-        token.type = accept_type[last_accept];
-        token.line = start_line;
-        token.column = start_col;
-        pos = last_accept_pos;
-        col = start_col + len;
-        
-        if (need_validation[last_accept]) {
-            if (token.type == TOKEN_IDENTIFIER && !validate_variable(token.lexeme))
-                token.type = TOKEN_ERROR;
-            if (token.type == TOKEN_LOOP_LABEL && !validate_loop_label(token.lexeme))
-                token.type = TOKEN_ERROR;
-        }
-        
-        return token;
-    }
-    
-    // Error
-    token.lexeme[0] = source[pos];
-    token.lexeme[1] = '\0';
-    token.type = TOKEN_ERROR;
-    pos++;
-    col++;
-    return token;
-}
+    /* choose file: argument or default */
+    const char *filename = (argc >= 2) ? argv[1] : "test.txt";
 
-// ============= MAIN =============
-int main() {
-    FILE *fp;
-    char filename[100];
-    char buffer[10000];
-    
-    printf("Enter source filename: ");
-    scanf("%s", filename);
-    
-    fp = fopen(filename, "r");
-    if (!fp) {
-        printf("Error opening file!\n");
-        return 1;
-    }
-    
-    size_t bytes = fread(buffer, 1, 9999, fp);
-    buffer[bytes] = '\0';
-    source = buffer;
-    fclose(fp);
-    
-    init_dfa();
-    
-    printf("\n+----------+------+------------------------+----------------------------------+\n");
-    printf("| Line     | Col  | TOKEN TYPE             | LEXEME                           |\n");
-    printf("+----------+------+------------------------+----------------------------------+\n");
-    
-    Token t;
-    int errors = 0, total = 0;
-    
-    do {
-        t = get_next_token();
-        total++;
-        
-        char *type_str;
-        switch(t.type) {
-            case TOKEN_INCLUDE: type_str = "INCLUDE"; break;
-            case TOKEN_COMMENT: type_str = "COMMENT"; break;
-            case TOKEN_DEC: type_str = "DEC"; break;
-            case TOKEN_INT: type_str = "INT"; break;
-            case TOKEN_IDENTIFIER: type_str = "IDENTIFIER"; break;
-            case TOKEN_FUNCTION: type_str = "FUNCTION"; break;
-            case TOKEN_LOOP_LABEL: type_str = "LOOP_LABEL"; break;
-            case TOKEN_WHILE: type_str = "WHILE"; break;
-            case TOKEN_RETURN: type_str = "RETURN"; break;
-            case TOKEN_BREAK: type_str = "BREAK"; break;
-            case TOKEN_PRINTF: type_str = "PRINTF"; break;
-            case TOKEN_NUMBER: type_str = "NUMBER"; break;
-            case TOKEN_OPERATOR: type_str = "OPERATOR"; break;
-            case TOKEN_DOTDOT: type_str = "DOTDOT"; break;
-            case TOKEN_LBRACKET: type_str = "LBRACKET"; break;
-            case TOKEN_RBRACKET: type_str = "RBRACKET"; break;
-            case TOKEN_LPAREN: type_str = "LPAREN"; break;
-            case TOKEN_RPAREN: type_str = "RPAREN"; break;
-            case TOKEN_COLON: type_str = "COLON"; break;
-            case TOKEN_COMMA: type_str = "COMMA"; break;
-            case TOKEN_EOF: type_str = "EOF"; break;
-            default: type_str = "ERROR"; errors++;
-        }
-        
-        if (t.type != TOKEN_EOF) {
-            printf("| %-8d | %-4d | %-22s | %-32s |\n", 
-                   t.line, t.column, type_str, t.lexeme);
-        }
-    } while (t.type != TOKEN_EOF);
-    
-    printf("+----------+------+------------------------+----------------------------------+\n");
-    printf("\nSUMMARY: Total=%d, Errors=%d, %s\n", total-1, errors, errors?"FAILED":"PASSED");
-    
+    printf("Reading source file: %s\n", filename);
+
+    char *source = read_file(filename);
+    if (!source) return 1;
+
+    tokenize(source);
+
+    free(source);
     return 0;
 }
