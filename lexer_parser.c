@@ -582,3 +582,6 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
+// run comand
+//  gcc lexer_parser.c -o lexer_parser && ./lexer_parser
