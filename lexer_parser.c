@@ -564,7 +564,7 @@ static void run_ll1_parser(const char *filename) {
 
 
 /* ============================================================
-   MAIN
+   MAIN FUNCTION
    ============================================================ */
 int main(int argc, char *argv[]) {
     const char *fn = (argc>=2) ? argv[1] : "test.txt";
